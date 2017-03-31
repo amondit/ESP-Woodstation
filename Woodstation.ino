@@ -4,14 +4,16 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 
-#include "ht1632c.h"
+#include "HT1632.h"
 
-/// framebuffer
-static uint8_t** ht1632c_framebuffer = 0;
-static uint8_t ht1632c_framebuffer_len = 96;
+#define ESP8266
+#define HT1632_CS   D1
+#define HT1632_CLK  D5
+#define HT1632_MOSI D7
 
-const char* ssid = "********";
-const char* password = "********";
+
+const char* ssid = "**************";
+const char* password = "*************";
 
 // NTP Servers:
 static const char ntpServerName[] = "europe.pool.ntp.org";
@@ -87,10 +89,10 @@ void setup()
   setSyncInterval(300);
 
   Serial.println("Setting up SPI display");
-  ht1632c_init(HT1632_CMD_8PMOS);
-  ht1632c_clear();
-  ht1632c_pwm(15);
-  ht1632c_sendframe();
+  HT1632.begin(HT1632_CS, HT1632_CLK, HT1632_MOSI);
+  HT1632.clear();
+  HT1632.setPixel(0,7); // ':' on time display
+  HT1632.setPixel(20,7); // ':' on time display
 }
 
 time_t prevDisplay = 0; // when the digital clock was displayed
@@ -116,47 +118,41 @@ void loop()
   delay(100);
 }
 
-void digitalClockDisplay()
-{
-  char buffer[7];
-  sprintf(buffer, "%02d%02d%02d", hour(), minute(), second());
-  Serial.println(buffer);
-}
-
-void printDigits(int digits)
-{
-  // utility for digital clock display: prints preceding colon and leading 0
-  Serial.print(":");
-  if (digits < 10)
-    Serial.print('0');
-  Serial.print(digits);
-}
-
-
-
-
 //------------------ Woodstation related data -------------------
+
+static int humidityDisplayBaseAddresses[2][2]=
+{
+    {0,0},
+    {7,0}
+};
+
+static int temperatureDisplayBaseAddresses[3][2]=
+{
+    {0,1},
+    {7,1},
+    {14,1}
+};
 
 static int timeDisplayBaseAddresses[6][2]=
 {
     {0,2},  //H
-    {14,2}, //H
-    {28,2}, //m
+    {7,2}, //H
+    {14,2}, //m
     {0,3},  //m
-    {14,3}, //s
-    {28,3}  //s
+    {7,3}, //s
+    {14,3}  //s
 };
 
 static int dateDisplayBaseAddresses[8][2]=
 {
-    {1,0},  //D
-    {15,0}, //D
-    {29,0}, //M
-    {1,1},  //M
-    {15,1}, //Y
-    {29,1}, //Y
+    {0,4},  //D
+    {7,4}, //D
+    {14,4}, //M
+    {0,5},  //M
+    {7,5}, //Y
+    {14,5}, //Y
     {1,2},  //Y
-    {29,1}  //Y
+    {7,6}  //Y
 };
 
 static int sevenSegmentDigits[10][7]=
@@ -180,26 +176,28 @@ void writeDisplayCharacterAtIndex(int* sevenSegmentCharBitSequence, int baseAddr
     return;
   int writeAddr = baseAddr;
   for (int i = 0; i < 7; ++i) {
-    ht1632c_update_framebuffer(writeAddr, bitIndex, sevenSegmentCharBitSequence[i]);
-    Serial.print(sevenSegmentCharBitSequence[i]);
-    writeAddr = writeAddr + 2;
+    if (sevenSegmentCharBitSequence[i]) {
+      HT1632.setPixel(writeAddr, bitIndex);
+    } else {
+      HT1632.clearPixel(writeAddr, bitIndex);
+    }
+    writeAddr++;
   }
-  Serial.println();
 }
 
 void updateTimeDisplay(char* newTime){
   int characterMap[7] = {0, 0, 0, 0, 0, 0, 0};
   int iValue = 0;
   char cValue = '0';
+  //HT1632.clear();
   for(int timeDigitIndex = 0; timeDigitIndex < 6; timeDigitIndex++){
     cValue = newTime[timeDigitIndex];
     iValue = atoi(&cValue);
-    Serial.println(iValue);
     int baseAddr = timeDisplayBaseAddresses[timeDigitIndex][0];
     int bitIndex = timeDisplayBaseAddresses[timeDigitIndex][1];
     writeDisplayCharacterAtIndex(sevenSegmentDigits[iValue], baseAddr, bitIndex);
   }
-  Serial.println();
+  HT1632.render();
 }
 
 
@@ -284,191 +282,4 @@ void sendNTPpacket(IPAddress &address)
   Udp.beginPacket(address, 123); //NTP requests are to port 123
   Udp.write(packetBuffer, NTP_PACKET_SIZE);
   Udp.endPacket();
-}
-
-
-//------------------- HT1632 Related data ------------
-
-void ht1632c_chipselect(const int value)
-{
-  digitalWrite(SS, toBit(value));
-}
-
-void ht1632c_sendcmd(const uint8_t cmd) {
-  uint16_t data = HT1632_ID_CMD;
-  data <<= HT1632_CMD_LEN;
-  data |= cmd;
-  data <<= 5;
-  //reverse_endian(&data, sizeof(data));
-  
-  ht1632c_chipselect(1);
-  SPI.write16(data);
-  ht1632c_chipselect(0);
-
-}
-
-void ht1632c_update_framebuffer(const int addr, const uint8_t bitIndex, const uint8_t bitValue)
-{
-  if(addr <0 || addr > (ht1632c_framebuffer_len-1) || bitIndex > 3)
-    return;
-  ht1632c_framebuffer[addr][bitIndex] = toBit(bitValue);
-}
-
-uint8_t ht1632c_get_framebuffer(const int addr, const uint8_t bitIndex)
-{
-  if(addr <0 || addr > (ht1632c_framebuffer_len-1) || bitIndex > 3)
-      return 0;
-  return ht1632c_framebuffer[addr][bitIndex];
-}
-
-//
-// public functions
-//
-
-int ht1632c_init(const uint8_t commonsMode)
-{
-  // init SPI
-  pinMode(SS, OUTPUT);
-  SPI.begin(); 
-  SPI.setBitOrder(MSBFIRST);
-  SPI.setClockDivider(SPI_CLOCK_DIV64);
-  SPI.setDataMode(SPI_MODE0);
-
-
-  switch (commonsMode) {
-    case HT1632_CMD_8NMOS:
-    case HT1632_CMD_8PMOS:
-      ht1632c_framebuffer_len = 64;
-      break;
-    case HT1632_CMD_16NMOS:
-    case HT1632_CMD_16PMOS:
-      ht1632c_framebuffer_len = 96;
-      break;
-    default:
-      break;
-  }
-
-
-  ht1632c_framebuffer = (uint8_t**) malloc(ht1632c_framebuffer_len*sizeof(uint8_t*));
-  if (!ht1632c_framebuffer) {
-    Serial.println( "Framebuffer allocation failed.");
-    return 3;
-  }
-
-  for (int i = 0; i < ht1632c_framebuffer_len; ++i) {
-    ht1632c_framebuffer[i] = (uint8_t*) malloc(4*sizeof(uint8_t));
-    if (!ht1632c_framebuffer[i]) {
-        Serial.println( "Framebuffer allocation failed.");
-        return 3;
-      }
-    ht1632c_framebuffer[i][0] = ht1632c_framebuffer[i][1] = ht1632c_framebuffer[i][1] = ht1632c_framebuffer[i][3] = 0;
-  }
-
-  // init display
-  ht1632c_sendcmd(HT1632_CMD_SYSDIS);
-  ht1632c_sendcmd(commonsMode);
-  ht1632c_sendcmd(HT1632_CMD_MSTMD);
-  ht1632c_sendcmd(HT1632_CMD_RCCLK);
-  ht1632c_sendcmd(HT1632_CMD_SYSON);
-  ht1632c_sendcmd(HT1632_CMD_LEDON);
-  ht1632c_sendcmd(HT1632_CMD_BLOFF);
-  ht1632c_sendcmd(HT1632_CMD_PWM);
-
-  ht1632c_clear();
-  ht1632c_sendframe();
-
-  return 0;
-}
-
-int ht1632c_close()
-{
-  SPI.end();
-  if (ht1632c_framebuffer) {
-    for (int i = 0; i < ht1632c_framebuffer_len; ++i) {
-      if (ht1632c_framebuffer[i]) {
-        free(ht1632c_framebuffer[i]);
-        ht1632c_framebuffer[i] = 0;
-      }
-    }
-    free(ht1632c_framebuffer);
-    ht1632c_framebuffer = 0;
-  }
-}
-
-void ht1632c_pwm(const uint8_t value)
-{
-  ht1632c_sendcmd(HT1632_CMD_PWM | (value & 0x0f));
-}
-
-void ht1632c_sendframe()
-{
-  uint16_t data = HT1632_ID_WR;
-  data <<= HT1632_ADDR_LEN;
-  data <<= 6;
-
-  //We append the first 1.5 addresses values, to fill the 16bit buffer
-  uint8_t bitValues = 0;
-  for (int j = 0; j < 4; ++j) {
-    bitValues <<= 1;
-    bitValues |= toBit(ht1632c_framebuffer[0][j]);
-  }
-  for (int j = 0; j < 2; ++j) {
-    bitValues <<= 1;
-    bitValues |= toBit(ht1632c_framebuffer[1][j]);
-  }
-  data |= bitValues;
-  //reverse_endian(&data, sizeof(data));
-
-  ht1632c_chipselect(1);
-  SPI.write16(data);
-
-
-  //Loop to write the frame buffer
-  int i = 1;
-  while (i < ht1632c_framebuffer_len) {
-    bitValues = 0;
-    //we copy the last 2 bits of the previous address,
-    //as they are truncated due to message size of 16b
-    //
-    //(format of bit values : AABB BBCC)
-    for (int j = 2; j < 4; ++j) {
-      bitValues <<= 1;
-      bitValues |= toBit(ht1632c_framebuffer[i][j]);
-    }
-    i++;
-    if (i == ht1632c_framebuffer_len) {
-      bitValues <<=6;
-    }else {
-      for (int j = 0; j < 4; ++j) {
-        bitValues <<= 1;
-        bitValues |= toBit(ht1632c_framebuffer[i][j]);
-      }
-      i++;
-      if (i == ht1632c_framebuffer_len) {
-        bitValues <<= 2;
-      }else {
-        for (int j = 0; j < 2; ++j) {
-          bitValues <<= 1;
-          bitValues |= toBit(ht1632c_framebuffer[i][j]);
-        }
-      }
-
-    }
-    SPI.write(bitValues);
-  }
-
-  ht1632c_chipselect(0);
-}
-
-void ht1632c_clear()
-{
-  // clear buffer
-  if (ht1632c_framebuffer) {
-    for (int i = 0; i < ht1632c_framebuffer_len; ++i) {
-      if (ht1632c_framebuffer[i]) {
-        ht1632c_framebuffer[i][0] = ht1632c_framebuffer[i][1] = ht1632c_framebuffer[i][1] = ht1632c_framebuffer[i][3] = 0;
-      }
-    }
-  }
-
 }
